@@ -12,6 +12,10 @@ import (
 
 type nodeKind int
 
+// inSetMinLen is the list length from which IN uses a hash set instead of a
+// linear scan. Below it the scan is as fast and the set only costs memory.
+const inSetMinLen = 64
+
 const (
 	nodeInvalid nodeKind = iota
 	nodeParen
@@ -60,11 +64,13 @@ type compareNode struct {
 	apply    func(Operand, Operand) (bool, error)
 	version  *versionCompare // set instead of using apply for a pre-parsed rule version
 	valKind  valueKind
-	rightOp  Operand // valueConst: operand set for the rule value
-	boolErr  error   // valueConst: failed boolean parse, reported on eval
-	valErr   error   // valueConst: error set on eval (invalid integer)
-	listErr  error   // lists: parse error of the first bad element; the list then holds the elements before it
-	listOp   Operand // lists: the parsed list ([]int, []float64 or []string)
+	rightOp  Operand             // valueConst: operand set for the rule value
+	boolErr  error               // valueConst: failed boolean parse, reported on eval
+	valErr   error               // valueConst: error set on eval (invalid integer)
+	listErr  error               // lists: parse error of the first bad element; the list then holds the elements before it
+	strSet   map[string]struct{} // lists: hash set of a long string list, used by IN
+	intSet   map[int]struct{}    // lists: hash set of a long int list, used by IN
+	listOp   Operand             // lists: the parsed list ([]int, []float64 or []string)
 }
 
 func newCompareNode(kind nodeKind, path []string) *compareNode {
@@ -251,6 +257,10 @@ func (n *compareNode) evalCompare(st *evalState) bool {
 	}
 	var ret bool
 	var err error
+	if r, ok := n.setIN(st); ok {
+		st.rightOp = nil
+		return r
+	}
 	if n.version != nil {
 		ret, err = n.version.compare(st.leftOp)
 	} else {
@@ -269,6 +279,41 @@ func (n *compareNode) evalCompare(st *evalState) bool {
 	}
 	st.rightOp = nil
 	return ret
+}
+
+// setIN answers IN for long compiled string/int lists with a hash lookup.
+// It preserves the linear scan's semantics (exact, case-sensitive string
+// equality; int left operand only). It applies only when the list is the
+// node's own parsed list (no listErr, no version operand) and the left operand
+// passes the same type check; otherwise it reports false and the regular
+// linear path runs, producing the original errors and debug errors.
+func (n *compareNode) setIN(st *evalState) (bool, bool) {
+	if n.opType != JsonQueryParserIN || n.listErr != nil || n.version != nil {
+		return false, false
+	}
+	switch {
+	case n.strSet != nil:
+		if l, ok := st.rightOp.([]string); !ok || len(l) != len(n.listOp.([]string)) || (len(l) > 0 && &l[0] != &n.listOp.([]string)[0]) {
+			return false, false
+		}
+		left, err := (&StringOperation{}).getString(st.leftOp)
+		if err != nil {
+			return false, false
+		}
+		_, found := n.strSet[left]
+		return found, true
+	case n.intSet != nil:
+		if l, ok := st.rightOp.([]int); !ok || len(l) != len(n.listOp.([]int)) || (len(l) > 0 && &l[0] != &n.listOp.([]int)[0]) {
+			return false, false
+		}
+		left, ok := st.leftOp.(int)
+		if !ok {
+			return false, false
+		}
+		_, found := n.intSet[left]
+		return found, true
+	}
+	return false, false
 }
 
 func (n *compareNode) setDebugErr(st *evalState, err error) {
@@ -568,6 +613,12 @@ func compileValue(n *compareNode, v IValueContext) Operation {
 			sub = next
 		}
 		n.listOp = ints[:len(ints):len(ints)]
+		if len(ints) >= inSetMinLen {
+			n.intSet = make(map[int]struct{}, len(ints))
+			for _, v := range ints {
+				n.intSet[v] = struct{}{}
+			}
+		}
 		return &IntOperation{}
 	case *ListOfDoublesContext:
 		n.valKind = valueDoubles
@@ -599,6 +650,12 @@ func compileValue(n *compareNode, v IValueContext) Operation {
 			sub = next
 		}
 		n.listOp = strs[:len(strs):len(strs)]
+		if len(strs) >= inSetMinLen {
+			n.strSet = make(map[string]struct{}, len(strs))
+			for _, v := range strs {
+				n.strSet[v] = struct{}{}
+			}
+		}
 		return &StringOperation{}
 	}
 	return &NullOperation{}
